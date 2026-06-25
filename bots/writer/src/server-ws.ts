@@ -16,6 +16,12 @@ import {
   extractTaskId, queryTask, queryTaskChain, initTaskStore,
   generateQuestionId, storeQuestion, storeAnswer,
 } from "../../../shared/dist/task-store.js";
+import {
+  loadBotState, saveBotState, formatStateSummary,
+  recordTaskStart, recordTaskComplete, recordChapterCompleted,
+  recordQuestionAsked, recordQuestionAnswered, recordOpenCodeSession,
+  setCurrentStep, type BotState,
+} from "../../../shared/dist/bot-state.js";
 import { patchConsoleTimestamp } from "../../../shared/dist/index.js";
 
 const SESSION_TIMEOUT = 10 * 60 * 1000;
@@ -105,14 +111,20 @@ async function getOrCreateSession(chatId: string, novelDir: string): Promise<Ses
 
 // ============ OpenCode 调用 ============
 
-async function sendToOpencode(session: Session, message: string, retries = 2): Promise<string> {
+async function sendToOpencode(session: Session, message: string, botState: BotState | null = null, retries = 2): Promise<string> {
   const [providerID, modelID] = (config.model || "").split("/");
+  // 把 bot 状态摘要注入 system prompt，让模型知道当前进度
+  const stateSummary = botState ? formatStateSummary(botState) : "";
+  const fullSystemPrompt = stateSummary
+    ? `${config.systemPrompt}\n\n${stateSummary}`
+    : config.systemPrompt;
+
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       // 注入 NOVEL_DIR 到 env，skill 内可作为 process.env.NOVEL_DIR 访问
       const requestBody: any = {
         parts: [{ type: "text", text: message }],
-        system: config.systemPrompt,
+        system: fullSystemPrompt,
         ...(providerID && modelID ? { model: { providerID, modelID } } : {}),
         ...(config.tools ? { tools: config.tools } : {}),
         env: { NOVEL_DIR: session.novelDir },
@@ -161,12 +173,18 @@ function handleQuestionTimeout(questionId: string): void {
   questionStates.delete(questionId);
 
   const continuePrompt = `主编暂未回复，请按默认方案继续执行。不要再提问，直接输出结果。`;
-  sendToOpencode(state.session, continuePrompt)
+  const botState = loadBotState(config.name, state.session.novelDir, state.chatId);
+  recordQuestionAnswered(botState, state.questionId);
+
+  sendToOpencode(state.session, continuePrompt, botState)
     .then(async (response) => {
       const { questions } = parseQuestionTags(response);
       if (questions.length > 0 && state.round < MAX_QUESTION_ROUNDS) {
         await handleQuestions(response, state.taskId, state.chatId, state.messageId, state.session, state.round);
       } else {
+        if (state.taskId) {
+          recordTaskComplete(botState, state.taskId, "completed");
+        }
         await sendFinalReply(state.chatId, state.messageId, state.taskId, response, undefined);
       }
     })
@@ -193,7 +211,11 @@ async function handleQuestions(
   if (round >= MAX_QUESTION_ROUNDS) {
     console.log(`⚠️ 已达最大提问轮次 (${MAX_QUESTION_ROUNDS})，自动继续`);
     const continuePrompt = `已达到最大提问次数，请按默认方案继续执行，不要再提问。`;
-    const continueResponse = await sendToOpencode(session, continuePrompt);
+    const botState = loadBotState(config.name, session.novelDir, chatId);
+    const continueResponse = await sendToOpencode(session, continuePrompt, botState);
+    if (taskId) {
+      recordTaskComplete(botState, taskId, "completed");
+    }
     await sendFinalReply(chatId, messageId, taskId, continueResponse, undefined);
     return;
   }
@@ -248,12 +270,19 @@ async function handleAnswerReceived(questionId: string, answer: string): Promise
   const answerPrompt = `主编回复：${answer}\n\n请继续执行。`;
   state.session.lastAccess = Date.now();
 
+  // 更新 bot 状态：这条提问已回答
+  const botState = loadBotState(config.name, state.session.novelDir, state.chatId);
+  recordQuestionAnswered(botState, questionId);
+
   try {
-    const response = await sendToOpencode(state.session, answerPrompt);
+    const response = await sendToOpencode(state.session, answerPrompt, botState);
     const { questions } = parseQuestionTags(response);
     if (questions.length > 0) {
       await handleQuestions(response, state.taskId, state.chatId, state.messageId, state.session, state.round);
     } else {
+      if (state.taskId) {
+        recordTaskComplete(botState, state.taskId, "completed");
+      }
       await sendFinalReply(state.chatId, state.messageId, state.taskId, response, undefined);
     }
   } catch (err) {
@@ -428,12 +457,36 @@ async function main() {
           }
 
           const session = await getOrCreateSession(chatId, novelDir);
-          const response = await sendToOpencode(session, prompt);
+          recordOpenCodeSession(loadBotState(config.name, novelDir, chatId), session.id);
+
+          // 加载 bot 状态（项目记忆），注入到 prompt
+          const botState = loadBotState(config.name, novelDir, chatId);
+          if (taskId) {
+            recordTaskStart(botState, taskId, "editor", cleanedText);
+          }
+          console.log(`🧠 [writer] 状态恢复: 章节=${botState.currentChapter} 已完成=${botState.chaptersCompleted.length}`);
+
+          const response = await sendToOpencode(session, prompt, botState);
 
           const { displayText, questions } = parseQuestionTags(response);
           if (questions.length > 0) {
+            const questionId = generateQuestionId();
+            const q = questions[0];
+            recordQuestionAsked(botState, questionId, taskId || "", q.content);
             await handleQuestions(response, taskId || "", chatId, messageId, session, 0);
           } else {
+            // 检测回复里是否提到完成了某章
+            const chapterMatch = displayText.match(/第(\d+)章[_\s：:]?(.+?)(?:\.md|完成|已写)/);
+            if (chapterMatch) {
+              const chapterNum = parseInt(chapterMatch[1]);
+              const chapterName = chapterMatch[2].trim().substring(0, 50);
+              const filename = `第${String(chapterNum).padStart(2, '0')}章_${chapterName}.md`;
+              recordChapterCompleted(botState, filename);
+              console.log(`📖 [writer] 记录章节完成: ${filename}`);
+            }
+            if (taskId) {
+              recordTaskComplete(botState, taskId, "completed");
+            }
             await sendFinalReply(chatId, messageId, taskId, displayText, message.mentions as any);
           }
         } catch (error) {

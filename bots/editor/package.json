@@ -2,7 +2,7 @@
   "name": "@novel-bots/editor",
   "version": "1.0.0",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./src/server-ws.ts",
   "scripts": {
     "dev": "tsx --tsconfig ../tsconfig.json src/server-ws.ts",
     "dev:http": "tsx --tsconfig ../tsconfig.json src/server.ts",
