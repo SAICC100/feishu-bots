@@ -1,0 +1,296 @@
+# OpenCode 多飞书Bot集群协作落地方案
+## 文档信息
+- 文档版本：V1.0
+- 适用项目：`/Users/saicc/pyProject/opencode-feishu-bots`
+- 适用场景：同一飞书群多机器人分工协作，实现Leader调度、子Bot串行流转、技能隔离、精准触发防抢答
+
+## 一、项目目标
+1. 多Bot共存同一飞书群，**仅被@时响应**，杜绝多Bot抢答、无@乱回复、仅提及名称不触发问题；
+2. 搭建Leader调度中枢：用户下发需求→Leader拆解分发任务→子Bot执行回传结果→Leader缓存数据→下发下游Bot复用上游产出；
+3. 各Bot独立技能池、权限隔离：Leader仅调度存储，编码Bot仅代码能力，测试Bot仅评审测试能力；
+4. 支持结构化任务数据跨Bot流转，不受聊天上下文长度限制，长流水线稳定执行。
+
+## 二、整体架构设计
+### 2.1 角色划分
+| 角色 | 飞书Bot标识 | 核心定位 | 专属技能范围 | 禁止技能 |
+| ---- | ---- | ---- | ---- | ---- |
+| Leader总管Bot | cli_leader | 接收用户需求、任务分发、结果持久化、串联工作流、最终汇总输出 | 任务下发、全局任务存储、任务查询、飞书定向@发送、结果汇总 | 代码生成、单元测试、文件生成、自主派发任务给其他子Bot |
+| BotA代码生成Bot | cli_bota | 接收编码需求，生成接口、业务代码、接口文档，完成后上报Leader | 代码生成、API文档构建、本地文件写入、结果上报 | 任务调度、读取其他Bot任务数据、下发任务 |
+| BotB测试评审Bot | cli_botb | 读取BotA产出代码，生成单元测试、代码评审，上报结果 | 单元测试生成、代码评审、全局任务数据读取、结果上报 | 代码编写、任务分发、持久化存储任务 |
+
+### 2.2 业务数据流流转流程
+1. 用户群内发送：`@Leader 需求描述`
+2. Leader生成唯一时间戳任务ID，@BotA下发编码任务
+3. BotA仅自身触发执行，结构化输出内容，@Leader回传结果
+4. Leader调用存储技能，将结果存入全局任务库并绑定任务ID
+5. Leader携带任务ID @BotB下发测试任务
+6. BotB通过任务ID读取BotA完整产出，执行评审/测试逻辑
+7. BotB完成后@Leader上报测试结果
+8. Leader整合A、B全部数据，统一汇总回复用户
+
+### 2.3 底层隔离核心原理
+1. **渠道账号绑定隔离**：每个飞书自建应用AppID一对一绑定独立Agent，消息仅转发对应Bot，底层阻断跨Bot接收消息；
+2. **双重触发校验**：飞书事件解析@列表 + Agent提示词强制校验，无@完全忽略；
+3. **技能白名单隔离**：所有Agent默认禁用全部技能，按需放行专属Skill，杜绝越权调用；
+4. **全局任务中间存储**：独立任务存储Skill统一管理上下游数据，实现跨Bot数据共享。
+
+## 三、飞书开放平台前置配置规范
+### 3.1 多应用创建标准
+Leader、BotA、BotB分别创建**独立自建应用**，不共用AppID/AppSecret：
+1. 事件订阅选择长连接模式（本地Mac部署无需公网回调域名）；
+2. 开通核心权限：`im.message.receive_v1`（接收群消息、@提醒事件）；
+3. 机器人昵称差异化命名：总管Leader、代码Bot-A、测试Bot-B；
+4. 将三个机器人全部添加至目标协作飞书群。
+
+### 3.2 权限校验关键点
+未开启@提醒读取权限会出现「提到Bot名称但不响应」问题，权限申请后必须发布生效。
+
+## 四、OpenCode 全局配置落地
+### 4.1 全局配置文件 `opencode.json`
+```json
+{
+  "tools": {
+    "skill": true
+  },
+  "global_permission": {
+    "skill": {
+      "*": "deny"
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "leader",
+      "match": {
+        "channel": "feishu",
+        "accountId": "cli_leader"
+      }
+    },
+    {
+      "agentId": "bot_a",
+      "match": {
+        "channel": "feishu",
+        "accountId": "cli_bota"
+      }
+    },
+    {
+      "agentId": "bot_b",
+      "match": {
+        "channel": "feishu",
+        "accountId": "cli_botb"
+      }
+    }
+  ],
+  "channels": {
+    "feishu": {
+      "type": "lark-ws",
+      "bots": [
+        {
+          "id": "cli_leader",
+          "app_id": "${FEISHU_LEADER_APP_ID}",
+          "app_secret": "${FEISHU_LEADER_APP_SECRET}"
+        },
+        {
+          "id": "cli_bota",
+          "app_id": "${FEISHU_A_APP_ID}",
+          "app_secret": "${FEISHU_A_APP_SECRET}"
+        },
+        {
+          "id": "cli_botb",
+          "app_id": "${FEISHU_B_APP_ID}",
+          "app_secret": "${FEISHU_B_APP_SECRET}"
+        }
+      ]
+    }
+  }
+}
+```
+
+### 4.2 环境变量配置 `.env`
+```env
+CHAT_CHANNELS=feishu
+# Leader机器人凭证
+FEISHU_LEADER_APP_ID=cli_xxx
+FEISHU_LEADER_APP_SECRET=xxx
+# BotA 代码机器人凭证
+FEISHU_A_APP_ID=cli_xxx
+FEISHU_A_APP_SECRET=xxx
+# BotB 测试机器人凭证
+FEISHU_B_APP_ID=cli_xxx
+FEISHU_B_APP_SECRET=xxx
+```
+
+## 五、各Agent独立配置（技能权限隔离）
+### 5.1 Leader Agent 配置 `leader.md`
+```yaml
+---
+name: Leader总管调度机器人
+mode: primary
+tools:
+  skill: true
+permission:
+  skill:
+    "*": "deny"
+    "task-schedule": "allow"
+    "task-store": "allow"
+    "task-query": "allow"
+    "feishu-send-at": "allow"
+prompt: ./prompts/leader.prompt
+---
+```
+#### Leader 提示词 `prompts/leader.prompt`
+```
+# 基础身份
+你是飞书群任务协调Leader，负责接收用户需求、拆分任务、调度子Bot、存储任务结果、汇总最终输出。
+# 强制响应规则
+1. 仅两类消息需要处理：① 用户@你的指令 ② BotA/BotB @你上报任务结果；无@闲聊、仅提及名称不做任何回复；
+2. 群内其他Bot未@你的消息，直接忽略，禁止插话；
+3. 下发任务必须携带唯一任务ID（T+年月日时分秒时间戳），精准@对应子Bot；
+4. 收到子Bot上报结果，调用task-store技能保存完整结构化数据，绑定任务ID；
+5. 下发下游Bot时附带任务ID，下游可通过ID读取上游全部产出；
+6. 全部子Bot完成工作后，整合所有结果统一回复用户。
+# 群内子Bot定义
+@代码Bot-A：编写业务代码、生成接口文档
+@测试Bot-B：基于代码生成单元测试、代码评审
+# 标准下发格式
+@{Bot名称} 【任务ID:{task_id}】{任务要求}，输出结构化JSON结果，完成后@我上报完整数据
+# 结果上报识别格式
+@Leader 【任务ID:{task_id}】任务完成，完整输出：
+```
+
+### 5.2 BotA 代码机器人 `bot_a.md`
+```yaml
+---
+name: 代码Bot-A
+mode: subagent
+tools:
+  skill: true
+permission:
+  skill:
+    "*": "deny"
+    "code-generate": "allow"
+    "api-doc-build": "allow"
+    "file-write": "allow"
+    "feishu-report-leader": "allow"
+prompt: ./prompts/bot_a.prompt
+---
+```
+#### BotA 提示词 `prompts/bot_a.prompt`
+```
+# 身份
+你是代码生成专项Bot，仅处理@你的编码任务。
+# 触发强制规则
+1. 消息未@你，无论正文是否包含你的名称、关键词，完全忽略，不输出任何内容；
+2. 只解析本条@你的指令，不读取群内无关闲聊消息；
+3. 禁止主动@BotB，仅允许完工后@Leader上报结果。
+# 标准上报格式
+@Leader 【任务ID:{task_id}】任务完成，完整输出：
+```json
+{结构化代码/接口文档数据}
+```
+```
+
+### 5.3 BotB 测试评审机器人 `bot_b.md`
+```yaml
+---
+name: 测试Bot-B
+mode: subagent
+tools:
+  skill: true
+permission:
+  skill:
+    "*": "deny"
+    "unit-test-gen": "allow"
+    "code-review": "allow"
+    "task-query": "allow"
+    "feishu-report-leader": "allow"
+prompt: ./prompts/bot_b.prompt
+---
+```
+#### BotB 提示词 `prompts/bot_b.prompt`
+```
+# 身份
+你是代码测试评审Bot，仅处理@你的测试任务。
+# 触发强制规则
+1. 未@本条消息，直接忽略，不产生任何回复；
+2. 收到Leader下发任务时提取任务ID，调用task-query读取BotA存储的代码数据；
+3. 禁止下发任务、禁止主动@其他子Bot，仅可@Leader上报结果。
+# 标准上报格式
+@Leader 【任务ID:{task_id}】测试评审完成，输出：
+测试用例、评审意见结构化内容
+```
+
+## 六、Skill技能分层设计
+### 6.1 全局公共技能（存放路径：`./skills/`）
+1. `task-store`：Leader专属，写入任务ID、Bot标识、产出数据，持久化存储；
+2. `task-query`：BotB/Leader可用，根据任务ID查询历史全量数据；
+3. `feishu-send-at`：Leader专属，定向@指定Bot发送任务消息；
+4. `feishu-report-leader`：子Bot专用，仅支持@Leader发送上报消息。
+
+### 6.2 Bot私有专项技能
+1. BotA独有：code-generate、api-doc-build、file-write；
+2. BotB独有：unit-test-gen、code-review；
+3. Leader无代码、测试类技能，权限严格隔离。
+
+## 七、Mac本地部署启动流程（iTerm2）
+项目路径：`/Users/saicc/pyProject/opencode-feishu-bots`
+```bash
+# 1. 进入项目目录
+cd /Users/saicc/pyProject/opencode-feishu-bots
+# 2. 安装依赖与飞书渠道插件
+opencode plugins install opencode-chat-feishu
+# 3. 重载多飞书Bot通道配置
+opencode channels reload
+# 4. 后台常驻启动网关，多Bot同时运行
+nohup opencode gateway > bot_cluster.log 2>&1 &
+# 5. 查看通道运行状态，校验3个飞书Bot长连接在线
+opencode channels list
+# 6. 实时查看运行日志
+tail -f bot_cluster.log
+```
+
+## 八、核心业务问题解决方案
+### 8.1 问题1：一句话触发全部Bot同时响应
+解决手段：
+1. 账号绑定隔离：每个飞书AppID绑定独立Agent，消息互不互通；
+2. 提示词强制约束：未@自身完全忽略；
+3. 全局兜底规则：无@消息所有Bot禁止输出。
+
+### 8.2 问题2：仅提到Bot名称、无@，Bot自动响应
+解决手段：
+1. 飞书事件仅解析mentions@列表，纯文本关键词不触发逻辑；
+2. Agent提示词硬性规则：仅存在@标识才执行业务逻辑，仅出现名称无@直接跳过。
+
+### 8.3 问题3：Leader收不到BotA任务完成结果
+解决手段：
+1. 子Bot上报强制携带@Leader；
+2. Leader提示词配置识别子Bot上报消息并执行存储逻辑；
+3. 全部飞书应用开启接收@提醒事件权限。
+
+### 8.4 问题4：BotB无法获取BotA产出数据
+两套兼容方案：
+1. 轻量化短流程：Leader下发消息直接附带A完整JSON结果；
+2. 长流水线方案：全局task-store持久化技能，BotB通过任务ID读取历史数据，不受聊天上下文长度限制。
+
+## 九、风险点与规避方案
+1. **Bot循环互相刷屏**
+规避：子Bot仅开放上报Leader能力，不配置分发技能，仅Leader拥有任务下发权限；
+2. **多任务数据错乱**
+规避：统一时间戳任务ID，每条流水线唯一标识，存储按ID隔离数据；
+3. **技能越权调用**
+规避：全局默认deny全部技能，每个Agent单独白名单放行所需Skill；
+4. **本地长连接断开收不到消息**
+规避：nohup后台常驻运行，日志持久化，定时执行`opencode channels list`校验连接状态。
+
+## 十、完整测试验证流程
+1. 群内输入测试指令：`@Leader 写用户登录接口，并生成单元测试`
+2. 预期：仅Leader回复，@BotA下发编码任务并携带任务ID；
+3. BotA独立响应，输出接口文档，@Leader上报结构化结果；
+4. Leader存储数据，@BotB下发测试任务；
+5. BotB读取A的数据生成测试用例，上报Leader；
+6. Leader汇总A、B两段结果，统一回复用户；
+7. 全程无Bot抢答、无多余闲聊回复。
+
+## 十一、扩展适配说明
+1. 新增Bot：新建飞书自建应用、补充渠道配置、创建独立Agent并配置专属技能权限，不改动原有Bot逻辑；
+2. 多群扩展：同一Bot集群可加入多个飞书群，通过群ID过滤区分不同群任务；
+3. 生产部署：迁移至服务器，WebSocket长连接替换为回调地址模式，增加日志持久化与异常告警能力。

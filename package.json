@@ -1,0 +1,17 @@
+{
+  "name": "novel-bots",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "create-bots": "./create-bots.sh",
+    "install": "./install.sh",
+    "start": "./start.sh",
+    "dev:editor": "cd bots/editor && npm run dev",
+    "dev:researcher": "cd bots/researcher && npm run dev",
+    "dev:analyst": "cd bots/analyst && npm run dev",
+    "dev:writer": "cd bots/writer && npm run dev",
+    "dev:jokester": "cd bots/jokester && npm run dev",
+    "dev:proofreader": "cd bots/proofreader && npm run dev",
+    "dev:worldbuilder": "cd bots/worldbuilder && npm run dev"
+  }
+}
